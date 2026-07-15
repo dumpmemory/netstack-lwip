@@ -119,8 +119,25 @@
 #define LWIP_CHKSUM_ALGORITHM 3
 
 #define TCP_MSS 1460
+// The lwIP TCP here is device-local (app <-> netstack, ~microsecond RTT), so a
+// small window still saturates it; the window mainly bounds how much unread
+// data buffers per connection (lwIP ooseq pbufs + the read channel). iOS keeps
+// it small so the worst-case buffering across its ~512 connections stays within
+// the Network Extension memory budget; other platforms keep the larger window
+// for higher single-stream throughput.
+#if defined __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#define TCP_WND (16 * TCP_MSS)
+#define TCP_SND_BUF (8 * TCP_MSS)
+#else
 #define TCP_WND (32 * TCP_MSS)
 #define TCP_SND_BUF (16 * TCP_MSS)
+#endif
+#else
+#define TCP_WND (32 * TCP_MSS)
+#define TCP_SND_BUF (16 * TCP_MSS)
+#endif
 
 // Shared heap for PBUF_RAM: TCP send buffers (up to TCP_SND_BUF per active
 // sender) and transient inbound pbufs. Sized for concurrent active transfer,
