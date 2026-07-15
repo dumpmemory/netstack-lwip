@@ -28,13 +28,24 @@ impl AtomicMutex {
     }
 
     pub fn lock(&self) -> AtomicMutexGuard<'_> {
+        // Critical sections are short, so spin first for the uncontended/brief
+        // case. But if the holder has been preempted by the OS scheduler,
+        // spinning forever just burns a core; after a bounded number of spins,
+        // yield the thread so the holder can be rescheduled.
+        const SPIN_LIMIT: u32 = 64;
+        let mut spins = 0u32;
         loop {
             if let Ok(m) = self.try_lock() {
                 break m;
             }
-            // Hint to the CPU that we're spinning so it can back off (e.g. yield
-            // an SMT sibling) instead of hammering the cache line at full speed.
-            std::hint::spin_loop();
+            if spins < SPIN_LIMIT {
+                spins += 1;
+                // Hint to the CPU that we're spinning so it can back off (e.g.
+                // yield an SMT sibling) instead of hammering the cache line.
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }
