@@ -102,3 +102,32 @@ All flows share one lwIP stack, so aggregate throughput is bounded by the single
 global lock serialising every call into lwIP; expect aggregate throughput to be
 lower than a single stream and to fall as the flow count rises. UDP has no flow
 control, so datagrams may be dropped (the test reports the loss rate).
+
+## Connection capacity & memory
+
+The stack is a VPN-style netstack meant to carry every connection on the device.
+Simultaneous TCP connection capacity is set by `MEMP_NUM_TCP_PCB` in
+`src/lwip/custom/lwipopts.h`, tuned per platform:
+
+| Platform | Max TCP connections | `MEM_SIZE` (heap) | `TCP_WND` / `TCP_SND_BUF` |
+| --- | --- | --- | --- |
+| iOS | ~512 | 1 MiB | 16·MSS / 8·MSS |
+| macOS / Linux / other | ~2048 | 8 MiB | 32·MSS / 16·MSS |
+
+How the limits work:
+
+- Each simultaneous connection needs one `tcp_pcb` (256 B). Idle/established
+  connections cost only that; `MEMP_NUM_TCP_PCB` is the hard ceiling. There is no
+  listen-backlog cap (`TCP_LISTEN_BACKLOG` is off).
+- Actively *transferring* connections additionally draw from the shared
+  `MEM_SIZE` heap (send buffers) and `MEMP_NUM_TCP_SEG` segment pool. These are
+  sized for realistic concurrent transfer, not for every connection at once;
+  exhausting them throttles a sender gracefully (it does not drop connections).
+- `MEM_SIZE` is a lazily-paged heap (only touched pages cost RAM); the `memp`
+  pools are fully allocated at init. `PBUF_POOL` is unused on this data path
+  (RX/TX use `PBUF_RAM`, UDP uses `PBUF_REF`), so its pool is kept minimal.
+- iOS uses a smaller window because the lwIP TCP is device-local (app ↔ netstack,
+  microsecond RTT) — a small window still saturates it, while bounding how much
+  unread data can buffer per connection. Received data waits in an unbounded
+  channel until read, up to roughly one `TCP_WND` per connection, so the
+  application should drain accepted `TcpStream`s promptly.
