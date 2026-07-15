@@ -82,3 +82,23 @@ round would collapse the transfer to one segment per round-trip. Because the
 pipe is in-memory, throughput is dominated by per-packet CPU cost, and small
 transfers are dominated by TCP slow-start — use a large `--bytes` (≥256 MiB) for
 a representative steady-state number.
+
+## Concurrent multi-connection / multi-protocol test
+
+`examples/concurrent.rs` drives many flows through a single `NetStack`
+**simultaneously** — TCP download + TCP upload + UDP upload + UDP download — and
+reports per-group aggregate throughput plus UDP loss:
+
+```sh
+# Defaults: 4 TCP down, 4 TCP up, 2 UDP up, 2 UDP down.
+cargo run --release --example concurrent
+
+# Options: --tcp-down N --tcp-up N --udp-up N --udp-down N
+#          --bytes B (per TCP flow) --udp-bytes B (per UDP flow) --udp-dgram S
+cargo run --release --example concurrent -- --tcp-down 16 --tcp-up 16 --udp-up 4 --udp-down 4
+```
+
+All flows share one lwIP stack, so aggregate throughput is bounded by the single
+global lock serialising every call into lwIP; expect aggregate throughput to be
+lower than a single stream and to fall as the flow count rises. UDP has no flow
+control, so datagrams may be dropped (the test reports the loss rate).
