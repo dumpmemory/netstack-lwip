@@ -20,4 +20,6 @@ pub use udp::UdpSocket;
 pub enum Error {
     #[error("LwIP error ({0})")]
     LwIP(i8),
+    #[error("a NetStack instance is already running")]
+    AlreadyRunning,
 }

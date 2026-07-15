@@ -1,4 +1,5 @@
 use std::marker::PhantomPinned;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, os::raw, pin::Pin, sync::Once, time};
 
 use futures::sink::Sink;
@@ -15,6 +16,12 @@ use super::LWIP_MUTEX;
 use crate::Error;
 
 static LWIP_INIT: Once = Once::new();
+
+// lwIP is a process-global singleton in this configuration (NO_SYS, one global
+// netif, global pcb lists and `OUTPUT_CB_PTR`). Only one NetStack may exist at a
+// time; this guards against a second one silently corrupting the first. Reset in
+// `Drop`, so a new NetStack can be created after the previous one is dropped.
+static NETSTACK_ALIVE: AtomicBool = AtomicBool::new(false);
 
 pub struct NetStack {
     rx: Receiver<Vec<u8>>,
@@ -34,7 +41,7 @@ pub struct NetStack {
 impl NetStack {
     pub fn new() -> Result<(Pin<Box<Self>>, Pin<Box<TcpListener>>, Pin<Box<UdpSocket>>), Error> {
         Ok((
-            NetStack::_new(512),
+            NetStack::_new(512)?,
             TcpListener::new()?,
             UdpSocket::new(64)?,
         ))
@@ -45,13 +52,17 @@ impl NetStack {
         udp_buffer_size: usize,
     ) -> Result<(Pin<Box<Self>>, Pin<Box<TcpListener>>, Pin<Box<UdpSocket>>), Error> {
         Ok((
-            NetStack::_new(stack_buffer_size),
+            NetStack::_new(stack_buffer_size)?,
             TcpListener::new()?,
             UdpSocket::new(udp_buffer_size)?,
         ))
     }
 
-    fn _new(buffer_size: usize) -> Pin<Box<Self>> {
+    fn _new(buffer_size: usize) -> Result<Pin<Box<Self>>, Error> {
+        if NETSTACK_ALIVE.swap(true, Ordering::AcqRel) {
+            return Err(Error::AlreadyRunning);
+        }
+
         LWIP_INIT.call_once(|| unsafe { lwip_init() });
 
         unsafe {
@@ -86,7 +97,7 @@ impl NetStack {
             OUTPUT_CB_PTR = output_tx;
         }
 
-        stack
+        Ok(stack)
     }
 
 }
@@ -110,6 +121,8 @@ impl Drop for NetStack {
             // reading this pointer concurrently, and it will no longer see it.
             drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>));
         };
+        // Allow a new NetStack to be created now that this one is gone.
+        NETSTACK_ALIVE.store(false, Ordering::Release);
     }
 }
 
