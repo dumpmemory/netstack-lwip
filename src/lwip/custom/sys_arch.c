@@ -188,11 +188,15 @@
     va_end(ap);
   }
 #else
-  #include <sys/time.h>
+  #include <time.h>
+  /* lwIP timers (RTO, TIME_WAIT, delayed-ACK, keepalive) key off deltas of
+   * sys_now(), so it must be monotonic. gettimeofday() returns the wall clock,
+   * which NTP/user/timezone adjustments can move backward (freezing timers) or
+   * forward (firing them all at once); use CLOCK_MONOTONIC instead. */
   u32_t sys_now(void)
   {
-      struct timeval te;
-      gettimeofday(&te, NULL);
-      return te.tv_sec*1000LL + te.tv_usec/1000;
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      return (u32_t)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
   }
 #endif

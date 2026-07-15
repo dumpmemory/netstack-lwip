@@ -30,13 +30,15 @@
 #ifndef LWIP_CUSTOM_LWIPOPTS_H
 #define LWIP_CUSTOM_LWIPOPTS_H
 
-// Android 平台指定記憶體對齊，避免 ARMv7 SIGBUS 未對齊訪存
-#if defined(__ANDROID__)
-    #if defined(__aarch64__)
-        #define MEM_ALIGNMENT 8  // 64-bit ARM 對齊
-    #else
-        #define MEM_ALIGNMENT 4  // 32-bit ARM / x86 對齊
-    #endif
+// Match memory alignment to the target's pointer width. lwIP's default is 1,
+// which is unsafe on 64-bit targets: structs placed in the `mem` heap would be
+// under-aligned and accessed with alignment-assuming loads (UB, and on ARM a
+// SIGBUS risk). Use the compiler's pointer size so every platform (Android,
+// iOS, macOS, Linux) gets 8 on 64-bit and 4 on 32-bit.
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ >= 8
+    #define MEM_ALIGNMENT 8
+#else
+    #define MEM_ALIGNMENT 4
 #endif
 
 // enable tun2socks logic
