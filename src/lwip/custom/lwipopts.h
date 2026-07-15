@@ -119,6 +119,16 @@
 #define LWIP_CHKSUM_ALGORITHM 3
 
 #define TCP_MSS 1460
+
+// TIME_WAIT lasts 2*TCP_MSL. The default MSL (60s) makes closed connections
+// linger 120s, holding a tcp_pcb each; under connection churn (a VPN carries
+// every short-lived connection on the device) that piles up TIME_WAIT pcbs and
+// pressures the shared MEMP_NUM_TCP_PCB pool. 2*MSL exists to let stale WAN
+// duplicates die before a 4-tuple is reused, but this netstack is device-local
+// (app <-> netstack, no WAN path for these segments), so a short MSL is safe
+// and frees pcbs ~6x faster (TIME_WAIT 20s instead of 120s).
+#define TCP_MSL 10000UL
+
 // The lwIP TCP here is device-local (app <-> netstack, ~microsecond RTT), so a
 // small window still saturates it; the window mainly bounds how much unread
 // data buffers per connection (lwIP ooseq pbufs + the read channel). iOS keeps
