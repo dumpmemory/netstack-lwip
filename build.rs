@@ -76,7 +76,11 @@ fn compile_lwip() {
         .include("src/lwip/custom")
         .include("src/lwip/include")
         .warnings(false)
-        .flag_if_supported("-Wno-everything");
+        .flag_if_supported("-Wno-everything")
+        // Keep ram_heap (a 2MB tentative definition in mem.c) out of Mach-O
+        // common symbols; ld would otherwise infer a 32KB alignment for it and
+        // warn about exceeding the 16KB segment alignment on Apple Silicon.
+        .flag_if_supported("-fno-common");
     if let Some(sdk_include_path) = sdk_include_path() {
         build.include(sdk_include_path);
     }
