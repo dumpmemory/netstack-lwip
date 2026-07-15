@@ -193,40 +193,53 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
             let mut closing = false;
 
             loop {
-                iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
-
-                let s = sockets.get_mut::<tcp::Socket>(handle);
-                match dir {
-                    Dir::Download => {
-                        while s.can_recv() {
-                            match s.recv_slice(&mut recv_scratch) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if start.is_none() {
-                                        start = Some(Instant::now());
+                // Drive smoltcp to quiescence before parking. smoltcp emits at
+                // most ONE segment per poll() call, so to keep a full window in
+                // flight we must poll repeatedly (doing socket I/O each pass)
+                // until poll reports nothing more happened. Polling once and
+                // then awaiting would collapse the transfer to one segment per
+                // scheduler round-trip (stop-and-wait).
+                loop {
+                    let s = sockets.get_mut::<tcp::Socket>(handle);
+                    match dir {
+                        Dir::Download => {
+                            while s.can_recv() {
+                                match s.recv_slice(&mut recv_scratch) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        if start.is_none() {
+                                            start = Some(Instant::now());
+                                        }
+                                        recv += n as u64;
                                     }
-                                    recv += n as u64;
                                 }
                             }
                         }
-                    }
-                    Dir::Upload => {
-                        while sent < total && s.can_send() {
-                            let want = ((total - sent) as usize).min(send_buf.len());
-                            match s.send_slice(&send_buf[..want]) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => sent += n as u64,
+                        Dir::Upload => {
+                            while sent < total && s.can_send() {
+                                let want = ((total - sent) as usize).min(send_buf.len());
+                                match s.send_slice(&send_buf[..want]) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => sent += n as u64,
+                                }
+                            }
+                            if sent >= total && !closing {
+                                s.close(); // send FIN once all data is queued
+                                closing = true;
                             }
                         }
-                        if sent >= total && !closing {
-                            s.close(); // send FIN once all data is queued
-                            closing = true;
-                        }
+                    }
+
+                    if iface.poll(SmolInstant::now(), &mut dev, &mut sockets)
+                        == smoltcp::iface::PollResult::None
+                    {
+                        break;
                     }
                 }
 
                 // Termination: download is done once we've received everything;
                 // upload once we've sent everything and the socket has closed.
+                let s = sockets.get_mut::<tcp::Socket>(handle);
                 let done = match dir {
                     Dir::Download => recv >= total,
                     Dir::Upload => closing && !s.is_open(),
@@ -235,26 +248,9 @@ async fn run_direction(dir: Dir, total: u64, chunk: usize, local_port: u16) -> R
                     break;
                 }
 
-                // Decide how long to wait before the next poll. `tokio::time`'s
-                // timer granularity is ~1ms, so waiting on it between every
-                // window would cap throughput regardless of the netstack. When
-                // smoltcp has work to do *now* (poll_delay == 0) we hot-loop via
-                // `yield_now` so the only latency measured is the netstack's own
-                // ACK/window round-trip; otherwise we park on `wake` (fired when
-                // lwIP emits a packet) with a 1ms timer backstop.
-                let delay = iface.poll_delay(SmolInstant::now(), &sockets);
-                match delay {
-                    Some(d) if d.total_micros() == 0 => {
-                        tokio::task::yield_now().await;
-                    }
-                    _ => {
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(1),
-                            wake.notified(),
-                        )
-                        .await;
-                    }
-                }
+                // Park until lwIP hands us a packet (ACK/data/window update),
+                // with a 1ms backstop for retransmit/timeout progress.
+                let _ = tokio::time::timeout(Duration::from_millis(1), wake.notified()).await;
             }
 
             // Flush any final ACK/FIN so the netstack side sees clean EOF.

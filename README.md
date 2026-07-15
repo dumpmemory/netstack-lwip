@@ -75,3 +75,10 @@ cargo run --release --example throughput -- --bytes 67108864 --dir both --chunk 
 It exercises the full data path (download: `TcpStream` write → `tcp_output` →
 stack `Stream`; upload: stack `Sink` → `tcp_in` → `TcpStream` read), asserts the
 exact byte count transferred, and prints MiB/s and Gbps per direction.
+
+The smoltcp peer is polled to quiescence each round so a full TCP window is kept
+in flight (smoltcp emits at most one segment per `poll()`); polling once per
+round would collapse the transfer to one segment per round-trip. Because the
+pipe is in-memory, throughput is dominated by per-packet CPU cost, and small
+transfers are dominated by TCP slow-start — use a large `--bytes` (≥256 MiB) for
+a representative steady-state number.
