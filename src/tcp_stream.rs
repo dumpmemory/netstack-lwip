@@ -1,5 +1,6 @@
 use std::marker::PhantomPinned;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin};
 
 use bytes::BytesMut;
@@ -11,6 +12,7 @@ use tokio::{
 };
 
 use super::lwip::*;
+use super::stack::StackHandle;
 use super::tcp_stream_context::TcpStreamContext;
 use super::util;
 use super::LWIP_MUTEX;
@@ -100,11 +102,14 @@ pub struct TcpStream {
     // Whether the write side has been shut down; touched only by the async side.
     closed: bool,
     is_eof: bool,
+    // Keeps the shared lwIP stack alive for as long as this connection exists,
+    // so the timer keeps driving it even if the netstack/listener are dropped.
+    _stack: Arc<StackHandle>,
     _pin: PhantomPinned,
 }
 
 impl TcpStream {
-    pub fn new(pcb: *mut tcp_pcb) -> Pin<Box<Self>> {
+    pub(crate) fn new(pcb: *mut tcp_pcb, stack: Arc<StackHandle>) -> Pin<Box<Self>> {
         unsafe {
             // Since we have no idea how to deal with a full bounded channel upon receiving
             // data from lwIP, an unbounded channel is used instead.
@@ -126,6 +131,7 @@ impl TcpStream {
                 read_rx,
                 closed: false,
                 is_eof: false,
+                _stack: stack,
                 _pin: PhantomPinned::default(),
             });
             let arg = &stream.callback_ctx as *const _;

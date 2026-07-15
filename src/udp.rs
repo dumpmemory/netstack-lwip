@@ -9,6 +9,7 @@ use log::{error, warn};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::lwip::*;
+use super::stack::StackHandle;
 use super::util;
 use crate::Error;
 
@@ -112,11 +113,13 @@ pub struct UdpSocket {
     // taken in `poll_next`.
     ctx: usize,
     rx: Receiver<UdpPkt>,
+    // Keeps the shared lwIP stack alive for as long as this socket exists.
+    _stack: Arc<StackHandle>,
     _pin: PhantomPinned
 }
 
 impl UdpSocket {
-    pub(crate) fn new(buffer_size: usize) -> Result<Pin<Box<Self>>, Error> {
+    pub(crate) fn new(buffer_size: usize, stack: Arc<StackHandle>) -> Result<Pin<Box<Self>>, Error> {
         unsafe {
             // lwIP is compiled with NO_SYS=1 (no internal locking), so every
             // call into it must be serialized by LWIP_MUTEX. The background
@@ -139,6 +142,7 @@ impl UdpSocket {
                 pcb: Arc::new(UdpPcb(pcb as usize)),
                 ctx,
                 rx,
+                _stack: stack,
                 _pin: PhantomPinned::default()
             });
             udp_recv(pcb, Some(udp_recv_cb), ctx as *mut raw::c_void);
@@ -148,7 +152,8 @@ impl UdpSocket {
 
     pub fn split(self: Pin<Box<Self>>) -> (SendHalf, RecvHalf) {
         let pcb = self.pcb.clone();
-        (SendHalf { pcb }, RecvHalf { socket: self })
+        let stack = self._stack.clone();
+        (SendHalf { pcb, _stack: stack }, RecvHalf { socket: self })
     }
 }
 
@@ -185,6 +190,9 @@ pub struct SendHalf {
     // Shared with the `RecvHalf`/`UdpSocket`; keeps the pcb alive for as long
     // as this half exists, so `send_to` can never hit a removed pcb.
     pcb: Arc<UdpPcb>,
+    // Keeps the shared lwIP stack (timer + output callback) alive so `send_to`
+    // still has a working output path even if the netstack is dropped first.
+    _stack: Arc<StackHandle>,
 }
 
 impl SendHalf {

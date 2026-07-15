@@ -1,5 +1,6 @@
 use std::marker::PhantomPinned;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{io, os::raw, pin::Pin, sync::Once, time};
 
 use futures::sink::Sink;
@@ -23,42 +24,78 @@ static LWIP_INIT: Once = Once::new();
 // `Drop`, so a new NetStack can be created after the previous one is dropped.
 static NETSTACK_ALIVE: AtomicBool = AtomicBool::new(false);
 
+/// Shared, reference-counted owner of the process-global lwIP stack state: the
+/// timer task, the output-callback `Sender`, and the `NETSTACK_ALIVE` guard.
+///
+/// `NetStack`, `TcpListener`, `UdpSocket` (and every `TcpStream`/`SendHalf`
+/// derived from them) each hold an `Arc<StackHandle>`, so teardown — aborting
+/// the timer, clearing `OUTPUT_CB_PTR`, freeing the `Sender`, and releasing the
+/// singleton guard — happens only when the *last* handle is dropped, regardless
+/// of the order the user drops them in. This removes the footgun where dropping
+/// `NetStack` first would silently stop driving lwIP for still-live listeners
+/// and streams (or let a second `NetStack` repoint the global callback).
+pub(crate) struct StackHandle {
+    // Raw pointer (kept as usize so `StackHandle` stays `Send`) to a
+    // heap-allocated `Sender` used only by the lwIP output callback. Owned here
+    // and freed on drop. Deliberately separate from `NetStack::rx` so the
+    // callback never has to form a reference to `NetStack`, which would alias
+    // the `&mut` taken in `poll_next` and be undefined behaviour.
+    output_tx: usize,
+    // Background task driving lwIP's timers; aborted on drop so it doesn't keep
+    // running (and calling into lwIP) after the stack is gone.
+    timer: JoinHandle<()>,
+}
+
+impl Drop for StackHandle {
+    fn drop(&mut self) {
+        log::trace!("drop netstack");
+        // Stop the timer task so it no longer drives lwIP after the stack is
+        // gone. It only holds LWIP_MUTEX inside a synchronous block (no `.await`
+        // in scope), so aborting can never leave the lock held.
+        self.timer.abort();
+        unsafe {
+            let _g = LWIP_MUTEX.lock();
+            // Only clear the global if it still points at our Sender: a later
+            // NetStack may have overwritten it.
+            if OUTPUT_CB_PTR == self.output_tx {
+                OUTPUT_CB_PTR = 0x0;
+            }
+            // Reclaim the callback Sender. Safe under the lock: the output
+            // callback only runs while LWIP_MUTEX is held, so it cannot be
+            // reading this pointer concurrently, and it will no longer see it.
+            drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>));
+        };
+        // Allow a new NetStack to be created now that this one is gone.
+        NETSTACK_ALIVE.store(false, Ordering::Release);
+    }
+}
+
 pub struct NetStack {
     rx: Receiver<Vec<u8>>,
     sink_buf: Option<Vec<u8>>, // We're flushing per item, no need large buffer.
-    // Raw pointer (kept as usize so `NetStack` stays `Send`) to a heap-allocated
-    // `Sender` used only by the lwIP output callback. Owned by this `NetStack`
-    // and freed on drop. Deliberately separate from `rx` so the callback never
-    // has to form a reference to `NetStack`, which would alias the `&mut` taken
-    // in `poll_next` and be undefined behaviour.
-    output_tx: usize,
-    // Background task driving lwIP's timers; aborted on drop so it doesn't
-    // keep running (and calling into lwIP) after the stack is gone.
-    timer: JoinHandle<()>,
+    // Keeps the shared lwIP stack alive for as long as this `NetStack` exists.
+    _stack: Arc<StackHandle>,
     _pin: PhantomPinned,
 }
 
 impl NetStack {
     pub fn new() -> Result<(Pin<Box<Self>>, Pin<Box<TcpListener>>, Pin<Box<UdpSocket>>), Error> {
-        Ok((
-            NetStack::_new(512)?,
-            TcpListener::new()?,
-            UdpSocket::new(64)?,
-        ))
+        NetStack::with_buffer_size(512, 64)
     }
 
     pub fn with_buffer_size(
         stack_buffer_size: usize,
         udp_buffer_size: usize,
     ) -> Result<(Pin<Box<Self>>, Pin<Box<TcpListener>>, Pin<Box<UdpSocket>>), Error> {
-        Ok((
-            NetStack::_new(stack_buffer_size)?,
-            TcpListener::new()?,
-            UdpSocket::new(udp_buffer_size)?,
-        ))
+        let (stack, handle) = NetStack::_new(stack_buffer_size)?;
+        // Each derived handle shares ownership of the stack, so it stays alive
+        // (timer running, callback registered) until all of them are dropped.
+        let listener = TcpListener::new(handle.clone())?;
+        let udp = UdpSocket::new(udp_buffer_size, handle)?;
+        Ok((stack, listener, udp))
     }
 
-    fn _new(buffer_size: usize) -> Result<Pin<Box<Self>>, Error> {
+    fn _new(buffer_size: usize) -> Result<(Pin<Box<Self>>, Arc<StackHandle>), Error> {
         if NETSTACK_ALIVE.swap(true, Ordering::AcqRel) {
             return Err(Error::AlreadyRunning);
         }
@@ -84,11 +121,12 @@ impl NetStack {
             }
         });
 
+        let handle = Arc::new(StackHandle { output_tx, timer });
+
         let stack = Box::pin(NetStack {
             rx,
             sink_buf: None,
-            output_tx,
-            timer,
+            _stack: handle.clone(),
             _pin: PhantomPinned::default(),
         });
 
@@ -97,33 +135,9 @@ impl NetStack {
             OUTPUT_CB_PTR = output_tx;
         }
 
-        Ok(stack)
+        Ok((stack, handle))
     }
 
-}
-
-impl Drop for NetStack {
-    fn drop(&mut self) {
-        log::trace!("drop netstack");
-        // Stop the timer task so it no longer drives lwIP after the stack is
-        // gone. It only holds LWIP_MUTEX inside a synchronous block (no `.await`
-        // in scope), so aborting can never leave the lock held.
-        self.timer.abort();
-        unsafe {
-            let _g = LWIP_MUTEX.lock();
-            // Only clear the global if it still points at our Sender: a later
-            // NetStack may have overwritten it.
-            if OUTPUT_CB_PTR == self.output_tx {
-                OUTPUT_CB_PTR = 0x0;
-            }
-            // Reclaim the callback Sender. Safe under the lock: the output
-            // callback only runs while LWIP_MUTEX is held, so it cannot be
-            // reading this pointer concurrently, and it will no longer see it.
-            drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>));
-        };
-        // Allow a new NetStack to be created now that this one is gone.
-        NETSTACK_ALIVE.store(false, Ordering::Release);
-    }
 }
 
 impl Stream for NetStack {
