@@ -5,9 +5,6 @@
 #![allow(dead_code)]
 #![allow(clippy::all)]
 
-// Note the bindings are generated on macOS.
-// This shouldn't be problematic since we only use lwip functions from
-// the bindings. We should have the bindings automatically generated
-// for each target at compile time, but I couldn't find a way to make
-// bindgen work with cross.
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bindings.rs"));
+// Bindings are generated at build time for the current target (see build.rs)
+// and written to OUT_DIR, so their ABI always matches the target.
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

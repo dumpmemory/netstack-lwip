@@ -22,3 +22,6 @@ Sessionx.vim
 tags
 # Persistent undo
 [._]*.un~
+
+# Generated at build time into OUT_DIR
+/src/bindings.rs

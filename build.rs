@@ -88,15 +88,15 @@ fn compile_lwip() {
     build.compile("liblwip.a");
 }
 
-fn generate_lwip_bindings() {
-    println!("cargo:rustc-link-lib=lwip");
-    // println!("cargo:rerun-if-changed=src/wrapper.h");
+fn generate_lwip_bindings(out_path: &Path) {
+    println!("cargo:rerun-if-changed=src/wrapper.h");
     println!("cargo:include=src/lwip/include");
 
     let sdk_include_path = sdk_include_path();
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target = env::var("TARGET").unwrap();
     let mut builder = bindgen::Builder::default()
         .header("src/wrapper.h")
         .size_t_is_usize(false)
@@ -104,26 +104,30 @@ fn generate_lwip_bindings() {
         .clang_arg("-I./src/lwip/custom")
         .clang_arg("-Wno-everything")
         .layout_tests(false)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks));
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+    // Parse the headers with the actual target's ABI so struct layouts and
+    // integer/pointer widths match the target rather than the build host.
     if arch == "aarch64" && os == "ios" {
+        // clang wants `arm64`, not `aarch64`, in the iOS triple.
         // https://github.com/rust-lang/rust-bindgen/issues/1211
         builder = builder.clang_arg("--target=arm64-apple-ios");
+    } else {
+        builder = builder.clang_arg(format!("--target={}", target));
     }
     if let Some(sdk_include_path) = sdk_include_path {
         builder = builder.clang_arg(format!("-I{}", sdk_include_path));
     }
     let bindings = builder.generate().expect("Unable to generate bindings");
 
-    let mut out_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    out_path = out_path.join("src");
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
 }
 
 fn main() {
-    if env::var("BINDINGS_GEN").is_ok() {
-        generate_lwip_bindings();
-    }
+    // Generate bindings for the current target on every build (into OUT_DIR, not
+    // the source tree) so the ABI always matches the target being compiled for.
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    generate_lwip_bindings(&out_path);
     compile_lwip();
 }
