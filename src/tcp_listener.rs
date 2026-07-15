@@ -35,8 +35,8 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
 
 pub struct TcpListener {
     tpcb: usize,
-    pub sender: UnboundedSender<Pin<Box<TcpStream>>>,
-    pub receiver: UnboundedReceiver<Pin<Box<TcpStream>>>,
+    sender: UnboundedSender<Pin<Box<TcpStream>>>,
+    receiver: UnboundedReceiver<Pin<Box<TcpStream>>>,
     _pin: PhantomPinned,
 }
 

@@ -141,14 +141,19 @@ impl TcpStream {
     }
 
     fn apply_pcb_opts(&self) {
+        // Set only the individual fields we care about, rather than round-
+        // tripping the whole `tcp_pcb` through read/write (which would clobber
+        // every other field). Use raw field pointers + unaligned access since
+        // the pcb has no alignment guarantee here.
         unsafe {
-            let mut pcb_v = std::ptr::read_unaligned(self.pcb as *const tcp_pcb);
+            let pcb = self.pcb as *mut tcp_pcb;
             #[cfg(target_os = "ios")]
             {
-                pcb_v.so_options |= SOF_KEEPALIVE as u8;
+                let so_options = std::ptr::addr_of_mut!((*pcb).so_options);
+                so_options.write_unaligned(so_options.read_unaligned() | SOF_KEEPALIVE as u8);
             }
-            pcb_v.flags |= TF_NODELAY as u16;
-            std::ptr::write_unaligned(self.pcb as *mut tcp_pcb, pcb_v);
+            let flags = std::ptr::addr_of_mut!((*pcb).flags);
+            flags.write_unaligned(flags.read_unaligned() | TF_NODELAY as tcpflags_t);
         }
     }
 

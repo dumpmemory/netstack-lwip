@@ -6,29 +6,26 @@ use super::lwip::*;
 
 pub fn to_socket_addr(addr: &ip_addr_t, port: u16_t) -> SocketAddr {
     unsafe {
-        match addr.type_ {
-            // Ipv4
-            0 => SocketAddr::new(IpAddr::V4(addr.u_addr.ip4.addr.to_ne_bytes().into()), port),
-            // Ipv6
-            6 => {
-                let addr = addr.u_addr.ip6.addr;
-                let p0 = addr[0].to_ne_bytes();
-                let p1 = addr[1].to_ne_bytes();
-                let p2 = addr[2].to_ne_bytes();
-                let p3 = addr[3].to_ne_bytes();
-                let mut p = [0u8; 16];
-                (&mut p[0..4]).copy_from_slice(&p0);
-                (&mut p[4..8]).copy_from_slice(&p1);
-                (&mut p[8..12]).copy_from_slice(&p2);
-                (&mut p[12..16]).copy_from_slice(&p3);
-                let addr = Ipv6Addr::from(p);
-                SocketAddr::new(IpAddr::V6(addr), port)
-            }
-            // FIXME Ipv4+Ipv6 (dual-stack)
-            _ => {
-                log::warn!("Unsupported IP address type");
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
-            }
+        let ty = addr.type_ as lwip_ip_addr_type;
+        if ty == lwip_ip_addr_type_IPADDR_TYPE_V4 {
+            SocketAddr::new(IpAddr::V4(addr.u_addr.ip4.addr.to_ne_bytes().into()), port)
+        } else if ty == lwip_ip_addr_type_IPADDR_TYPE_V6 {
+            let addr = addr.u_addr.ip6.addr;
+            let p0 = addr[0].to_ne_bytes();
+            let p1 = addr[1].to_ne_bytes();
+            let p2 = addr[2].to_ne_bytes();
+            let p3 = addr[3].to_ne_bytes();
+            let mut p = [0u8; 16];
+            (&mut p[0..4]).copy_from_slice(&p0);
+            (&mut p[4..8]).copy_from_slice(&p1);
+            (&mut p[8..12]).copy_from_slice(&p2);
+            (&mut p[12..16]).copy_from_slice(&p3);
+            let addr = Ipv6Addr::from(p);
+            SocketAddr::new(IpAddr::V6(addr), port)
+        } else {
+            // FIXME Ipv4+Ipv6 (dual-stack, IPADDR_TYPE_ANY)
+            log::warn!("Unsupported IP address type");
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
         }
     }
 }
@@ -42,7 +39,7 @@ pub fn to_ip_addr_t(ip: IpAddr) -> ip_addr_t {
                         addr: u32::from_ne_bytes(ip4.octets()),
                     },
                 },
-                type_: 0, // Ipv4
+                type_: lwip_ip_addr_type_IPADDR_TYPE_V4 as u8,
             }
         }
         IpAddr::V6(ip6) => {
@@ -65,7 +62,7 @@ pub fn to_ip_addr_t(ip: IpAddr) -> ip_addr_t {
                 u_addr: ip_addr__bindgen_ty_1 {
                     ip6: ip6_addr { addr, zone: 0 },
                 },
-                type_: 6, // Ipv6
+                type_: lwip_ip_addr_type_IPADDR_TYPE_V6 as u8,
             }
         }
     }
@@ -81,7 +78,7 @@ mod test {
             let addr = to_socket_addr(&ip_addr_any_type, 80);
             assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80));
             let mut v6_addr = ip_addr_any_type;
-            v6_addr.type_ = 6;
+            v6_addr.type_ = lwip_ip_addr_type_IPADDR_TYPE_V6 as u8;
             let addr = to_socket_addr(&v6_addr, 80);
             assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 80));
         }

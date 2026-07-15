@@ -20,7 +20,9 @@ fn output(_netif: *mut netif, p: *mut pbuf) -> err_t {
         // NetStack` formed in `poll_next`. A full channel drops the packet;
         // lwIP/TCP will retransmit as needed.
         let tx = &*(OUTPUT_CB_PTR as *const Sender<Vec<u8>>);
-        let _ = tx.try_send(buf);
+        if tx.try_send(buf).is_err() {
+            log::trace!("netstack output channel full, dropping outbound packet");
+        }
         err_enum_t_ERR_OK as err_t
     }
 }

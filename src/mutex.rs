@@ -32,6 +32,9 @@ impl AtomicMutex {
             if let Ok(m) = self.try_lock() {
                 break m;
             }
+            // Hint to the CPU that we're spinning so it can back off (e.g. yield
+            // an SMT sibling) instead of hammering the cache line at full speed.
+            std::hint::spin_loop();
         }
     }
 }

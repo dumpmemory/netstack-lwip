@@ -33,8 +33,8 @@ pub unsafe extern "C" fn udp_recv_cb(
     pbuf_copy_partial(p, buf.as_mut_ptr() as *mut _, tot_len, 0);
     buf.set_len(tot_len as usize);
     pbuf_free(p);
-    if let Err(_) = socket.tx.try_send((buf, src_addr, dst_addr)) {
-        // log::trace!("try send udp pkt failed (netstack): {}", e);
+    if socket.tx.try_send((buf, src_addr, dst_addr)).is_err() {
+        log::trace!("netstack udp recv channel full, dropping inbound datagram");
     }
     if let Some(waker) = socket.waker.as_ref() {
         waker.wake_by_ref();
