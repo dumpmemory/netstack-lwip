@@ -3,7 +3,7 @@ use std::marker::PhantomPinned;
 use std::sync::Arc;
 
 use futures::stream::Stream;
-use futures::task::{Context, Poll, Waker};
+use futures::task::{Context, Poll};
 use futures::StreamExt;
 use log::{error, warn};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -25,7 +25,13 @@ pub unsafe extern "C" fn udp_recv_cb(
         warn!("udp socket has been closed");
         return;
     }
-    let socket = &mut *(arg as *mut UdpSocket);
+    // SAFETY: `arg` points to the `UdpSocketContext` of a still-alive
+    // `UdpSocket`. The context is a separate heap allocation (not a field
+    // reached by `poll_next`'s `&mut`), so this shared reference can never alias
+    // that `&mut`, and only shared references are ever formed to it. `Sender` is
+    // `Sync`, so `try_send` needs no lock. `UdpSocket::drop` unregisters this
+    // callback under `LWIP_MUTEX` before freeing the context, so it is valid.
+    let ctx = &*(arg as *const UdpSocketContext);
     let src_addr = util::to_socket_addr(&*addr, port);
     let dst_addr = util::to_socket_addr(&*dst_addr, dst_port);
     let tot_len = std::ptr::read_unaligned(p).tot_len;
@@ -33,12 +39,11 @@ pub unsafe extern "C" fn udp_recv_cb(
     pbuf_copy_partial(p, buf.as_mut_ptr() as *mut _, tot_len, 0);
     buf.set_len(tot_len as usize);
     pbuf_free(p);
-    if socket.tx.try_send((buf, src_addr, dst_addr)).is_err() {
+    if ctx.tx.try_send((buf, src_addr, dst_addr)).is_err() {
         log::trace!("netstack udp recv channel full, dropping inbound datagram");
     }
-    if let Some(waker) = socket.waker.as_ref() {
-        waker.wake_by_ref();
-    }
+    // No manual waker: `poll_next`'s `rx.poll_recv` registers the task's waker
+    // and the channel wakes it when this `try_send` succeeds.
 }
 
 fn send_udp(
@@ -74,6 +79,16 @@ fn send_udp(
 
 type UdpPkt = (Vec<u8>, SocketAddr, SocketAddr);
 
+/// State shared between a `UdpSocket` and the lwIP `udp_recv` callback.
+///
+/// Lives in its own heap allocation (owned by `UdpSocket` as a raw pointer) so
+/// the callback reaches it through a shared `&UdpSocketContext` and never forms
+/// a reference into `UdpSocket` itself, which would alias the `&mut` taken in
+/// `poll_next`. `Sender` is `Sync`, so the callback needs no surrounding lock.
+struct UdpSocketContext {
+    tx: Sender<UdpPkt>,
+}
+
 /// Shared ownership of the underlying lwIP `udp_pcb`.
 ///
 /// The pcb is removed only when the last handle (the `UdpSocket`/`RecvHalf`
@@ -90,8 +105,12 @@ impl Drop for UdpPcb {
 
 pub struct UdpSocket {
     pcb: Arc<UdpPcb>,
-    waker: Option<Waker>,
-    tx: Sender<UdpPkt>,
+    // Raw pointer (kept as usize so `UdpSocket` stays `Send`) to the
+    // heap-allocated `UdpSocketContext` used only by the lwIP recv callback.
+    // Owned here and freed on drop. Kept separate from `rx` so the callback
+    // never forms a reference into `UdpSocket`, which would alias the `&mut`
+    // taken in `poll_next`.
+    ctx: usize,
     rx: Receiver<UdpPkt>,
     _pin: PhantomPinned
 }
@@ -105,21 +124,24 @@ impl UdpSocket {
             // be running by the time this is called.
             let _g = super::LWIP_MUTEX.lock();
             let pcb = udp_new();
-            let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
-            let socket = Box::pin(Self {
-                pcb: Arc::new(UdpPcb(pcb as usize)),
-                waker: None,
-                tx,
-                rx,
-                _pin: PhantomPinned::default()
-            });
+            // Bind before building the socket so a failure doesn't drop a
+            // half-initialised `UdpSocket` (whose `Drop` would re-take this
+            // non-reentrant lock and deadlock).
             let err = udp_bind(pcb, &ip_addr_any_type, 0);
             if err != err_enum_t_ERR_OK as err_t {
                 error!("bind UDP failed: {}", err);
+                udp_remove(pcb);
                 return Err(Error::LwIP(err));
             }
-            let arg = &*socket as *const UdpSocket as *mut raw::c_void;
-            udp_recv(pcb, Some(udp_recv_cb), arg);
+            let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
+            let ctx = Box::into_raw(Box::new(UdpSocketContext { tx })) as usize;
+            let socket = Box::pin(Self {
+                pcb: Arc::new(UdpPcb(pcb as usize)),
+                ctx,
+                rx,
+                _pin: PhantomPinned::default()
+            });
+            udp_recv(pcb, Some(udp_recv_cb), ctx as *mut raw::c_void);
             Ok(socket)
         }
     }
@@ -140,6 +162,10 @@ impl Drop for UdpSocket {
         let _g = super::LWIP_MUTEX.lock();
         unsafe {
             udp_recv(self.pcb.0 as *mut udp_pcb, None, std::ptr::null_mut());
+            // Reclaim the callback context. Safe under the lock: the callback
+            // only runs while LWIP_MUTEX is held and has just been unregistered,
+            // so it can no longer observe this pointer.
+            drop(Box::from_raw(self.ctx as *mut UdpSocketContext));
         }
     }
 }
@@ -149,15 +175,9 @@ impl Stream for UdpSocket {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        match this.rx.poll_recv(cx) {
-            Poll::Ready(Some(pkt)) => Poll::Ready(Some(pkt)),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                this.waker.replace(cx.waker().clone());
-                Poll::Pending
-            }
-        }
+        // `poll_recv` registers `cx`'s waker; the recv callback's `try_send`
+        // wakes it. No separate waker handling is needed.
+        this.rx.poll_recv(cx)
     }
 }
 
