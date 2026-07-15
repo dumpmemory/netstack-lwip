@@ -257,13 +257,27 @@ impl Drop for TcpStream {
         trace!("netstack tcp drop {}", &self.callback_ctx.local_addr);
         if !self.callback_ctx.errored.load(Ordering::Acquire) {
             unsafe {
-                tcp_arg(self.pcb as *mut tcp_pcb, std::ptr::null_mut());
-                tcp_recv(self.pcb as *mut tcp_pcb, None);
-                tcp_sent(self.pcb as *mut tcp_pcb, None);
-                tcp_err(self.pcb as *mut tcp_pcb, None);
-                tcp_poll(self.pcb as *mut tcp_pcb, None, 0);
-                if !self.closed {
-                    tcp_abort(self.pcb as *mut tcp_pcb);
+                let pcb = self.pcb as *mut tcp_pcb;
+                // Detach our callbacks first: the TcpStreamContext is freed once
+                // this Drop returns, so lwIP must not call back into it. With
+                // recv cleared, lwIP falls back to tcp_recv_null, which drains
+                // any further input and closes on the peer's FIN.
+                tcp_arg(pcb, std::ptr::null_mut());
+                tcp_recv(pcb, None);
+                tcp_sent(pcb, None);
+                tcp_err(pcb, None);
+                tcp_poll(pcb, None, 0);
+                if self.closed {
+                    // poll_shutdown only closed the TX side (SHUT_WR), which
+                    // does not set TF_RXCLOSED, so lwIP would never time out a
+                    // pcb parked in FIN_WAIT_2 awaiting the peer's FIN — leaking
+                    // it. tcp_close sets TF_RXCLOSED and hands the pcb back for
+                    // reclamation; fall back to abort if it can't (ERR_MEM).
+                    if tcp_close(pcb) != err_enum_t_ERR_OK as err_t {
+                        tcp_abort(pcb);
+                    }
+                } else {
+                    tcp_abort(pcb);
                 }
             }
         }
