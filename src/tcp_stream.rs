@@ -193,61 +193,92 @@ impl AsyncRead for TcpStream {
         buf: &mut ReadBuf,
     ) -> Poll<io::Result<()>> {
         let me = unsafe { self.get_unchecked_mut() };
-        let _guard = LWIP_MUTEX.lock();
+        // `errored` is atomic and the channel/overflow are touched only by this
+        // async side, so the whole drain runs WITHOUT LWIP_MUTEX. Only the
+        // window update (tcp_recved) needs lwIP, so we take the lock once at the
+        // end for the total bytes consumed — turning "lock held for the entire
+        // read" into "lock held for one window update", which is what lets many
+        // connections' reads interleave instead of serialising on the drain.
         if me.callback_ctx.errored.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
+
+        let mut consumed: usize = 0;
+        let result: Poll<io::Result<()>>;
+
         if !me.read_overflow.is_empty() {
             let to_read = min(buf.remaining(), me.read_overflow.len());
             let piece = me.read_overflow.split_to(to_read);
             buf.put_slice(&piece[..to_read]);
-            // Advance the receive window for the overflow bytes now that they've
-            // been consumed (they weren't counted when first received).
-            if to_read > 0 {
-                unsafe { tcp_recved(me.pcb as *mut tcp_pcb, to_read as u16_t) };
-            }
-            return Poll::Ready(Ok(()));
-        }
-        let mut has_read_data = false;
-        loop {
-            match Pin::new(&mut me.read_rx).poll_recv(cx) {
-                Poll::Ready(Some(data)) => {
-                    // An empty vec is a sentinel: EOF, or a broken pipe if the
-                    // error callback fired.
-                    if data.is_empty() {
-                        if me.callback_ctx.errored.load(Ordering::Acquire) {
-                            return Poll::Ready(Err(broken_pipe()));
+            consumed += to_read;
+            result = Poll::Ready(Ok(()));
+        } else {
+            let mut has_read_data = false;
+            loop {
+                match Pin::new(&mut me.read_rx).poll_recv(cx) {
+                    Poll::Ready(Some(data)) => {
+                        // An empty vec is a sentinel: EOF, or a broken pipe if
+                        // the error callback fired.
+                        if data.is_empty() {
+                            if me.callback_ctx.errored.load(Ordering::Acquire) {
+                                result = Poll::Ready(Err(broken_pipe()));
+                            } else {
+                                me.is_eof = true;
+                                result = Poll::Ready(Ok(()));
+                            }
+                            break;
                         }
-                        me.is_eof = true;
-                        return Poll::Ready(Ok(()));
+                        let to_read = min(buf.remaining(), data.len());
+                        buf.put_slice(&data[..to_read]);
+                        // Count only bytes actually handed to the caller, so the
+                        // announced window reflects real consumption. Any
+                        // remainder is stashed and counted when later drained.
+                        consumed += to_read;
+                        has_read_data = true;
+                        if to_read < data.len() {
+                            me.read_overflow.extend_from_slice(&data[to_read..]);
+                            result = Poll::Ready(Ok(()));
+                            break;
+                        }
+                        if buf.remaining() == 0 {
+                            result = Poll::Ready(Ok(()));
+                            break;
+                        }
                     }
-                    let to_read = min(buf.remaining(), data.len());
-                    buf.put_slice(&data[..to_read]);
-                    // Advance lwIP's receive window only for the bytes actually
-                    // handed to the caller, so flow control (the announced
-                    // window) reflects real consumption. Any remainder is
-                    // stashed and its window advanced when it is later drained.
-                    if to_read > 0 {
-                        unsafe { tcp_recved(me.pcb as *mut tcp_pcb, to_read as u16_t) };
+                    Poll::Ready(None) => {
+                        result = Poll::Ready(Err(broken_pipe()));
+                        break;
                     }
-                    has_read_data = true;
-                    if to_read < data.len() {
-                        me.read_overflow.extend_from_slice(&data[to_read..]);
-                        return Poll::Ready(Ok(()));
+                    Poll::Pending => {
+                        result = if has_read_data || me.is_eof {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        };
+                        break;
                     }
-                }
-                Poll::Ready(None) => return Poll::Ready(Err(broken_pipe())),
-                Poll::Pending => {
-                    return if has_read_data {
-                        Poll::Ready(Ok(()))
-                    } else if me.is_eof {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Pending
-                    };
                 }
             }
         }
+
+        if consumed > 0 {
+            let _guard = LWIP_MUTEX.lock();
+            // Re-check under the lock: during the lockless drain, tcp_err_cb
+            // (which runs under LWIP_MUTEX) may have fired and lwIP may have
+            // freed the pcb, so calling tcp_recved on it would be use-after-free.
+            if !me.callback_ctx.errored.load(Ordering::Acquire) {
+                // tcp_recved takes a u16, but a single read can consume more
+                // than 65535 bytes (e.g. a 64 KiB buffer), so advance the window
+                // in u16-sized chunks rather than truncating.
+                let mut remaining = consumed;
+                while remaining > 0 {
+                    let chunk = remaining.min(u16::MAX as usize);
+                    unsafe { tcp_recved(me.pcb as *mut tcp_pcb, chunk as u16_t) };
+                    remaining -= chunk;
+                }
+            }
+        }
+        result
     }
 }
 
