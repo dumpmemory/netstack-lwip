@@ -84,6 +84,11 @@ pub struct UdpSocket {
 impl UdpSocket {
     pub(crate) fn new(buffer_size: usize) -> Result<Pin<Box<Self>>, Error> {
         unsafe {
+            // lwIP is compiled with NO_SYS=1 (no internal locking), so every
+            // call into it must be serialized by LWIP_MUTEX. The background
+            // `sys_check_timeouts` task spawned in `NetStack::_new` may already
+            // be running by the time this is called.
+            let _g = super::LWIP_MUTEX.lock();
             let pcb = udp_new();
             let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
             let socket = Box::pin(Self {
