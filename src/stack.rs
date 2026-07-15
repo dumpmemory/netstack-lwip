@@ -3,7 +3,7 @@ use std::{io, os::raw, pin::Pin, sync::Once, time};
 
 use futures::sink::Sink;
 use futures::stream::Stream;
-use futures::task::{Context, Poll, Waker};
+use futures::task::{Context, Poll};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::lwip::*;
@@ -16,10 +16,14 @@ use crate::Error;
 static LWIP_INIT: Once = Once::new();
 
 pub struct NetStack {
-    waker: Option<Waker>,
-    tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
     sink_buf: Option<Vec<u8>>, // We're flushing per item, no need large buffer.
+    // Raw pointer (kept as usize so `NetStack` stays `Send`) to a heap-allocated
+    // `Sender` used only by the lwIP output callback. Owned by this `NetStack`
+    // and freed on drop. Deliberately separate from `rx` so the callback never
+    // has to form a reference to `NetStack`, which would alias the `&mut` taken
+    // in `poll_next` and be undefined behaviour.
+    output_tx: usize,
     _pin: PhantomPinned,
 }
 
@@ -53,17 +57,18 @@ impl NetStack {
         }
 
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel(buffer_size);
+        let output_tx = Box::into_raw(Box::new(tx)) as usize;
 
         let stack = Box::pin(NetStack {
-            waker: None,
-            tx,
             rx,
             sink_buf: None,
+            output_tx,
             _pin: PhantomPinned::default(),
         });
 
         unsafe {
-            OUTPUT_CB_PTR = &*stack as *const NetStack as usize;
+            let _g = LWIP_MUTEX.lock();
+            OUTPUT_CB_PTR = output_tx;
         }
 
         tokio::spawn(async move {
@@ -79,14 +84,6 @@ impl NetStack {
         stack
     }
 
-    pub fn output(&mut self, pkt: Vec<u8>) {
-        if let Err(_) = self.tx.try_send(pkt) {
-            // log::trace!("try send stack output pkt failed: {}", e);
-        }
-        if let Some(waker) = self.waker.as_ref() {
-            waker.wake_by_ref();
-        }
-    }
 }
 
 impl Drop for NetStack {
@@ -94,7 +91,15 @@ impl Drop for NetStack {
         log::trace!("drop netstack");
         unsafe {
             let _g = LWIP_MUTEX.lock();
-            OUTPUT_CB_PTR = 0x0;
+            // Only clear the global if it still points at our Sender: a later
+            // NetStack may have overwritten it.
+            if OUTPUT_CB_PTR == self.output_tx {
+                OUTPUT_CB_PTR = 0x0;
+            }
+            // Reclaim the callback Sender. Safe under the lock: the output
+            // callback only runs while LWIP_MUTEX is held, so it cannot be
+            // reading this pointer concurrently, and it will no longer see it.
+            drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>));
         };
     }
 }
@@ -104,13 +109,12 @@ impl Stream for NetStack {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let me = unsafe { self.get_unchecked_mut() };
+        // `poll_recv` registers `cx`'s waker on `Pending` and the channel wakes
+        // it when the output callback sends, so no manual waker is needed.
         match me.rx.poll_recv(cx) {
             Poll::Ready(Some(pkt)) => Poll::Ready(Some(Ok(pkt))),
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                me.waker.replace(cx.waker().clone());
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }

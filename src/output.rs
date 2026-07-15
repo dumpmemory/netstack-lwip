@@ -1,5 +1,6 @@
+use tokio::sync::mpsc::Sender;
+
 use super::lwip::*;
-use super::NetStack;
 
 pub static mut OUTPUT_CB_PTR: usize = 0x0;
 
@@ -12,8 +13,14 @@ fn output(_netif: *mut netif, p: *mut pbuf) -> err_t {
         if OUTPUT_CB_PTR == 0x0 {
             return err_enum_t_ERR_ABRT as err_t;
         }
-        let stack = &mut *(OUTPUT_CB_PTR as *mut NetStack);
-        stack.output(buf);
+        // SAFETY: lwIP invokes this only while LWIP_MUTEX is held, and
+        // NetStack::drop clears OUTPUT_CB_PTR (and frees the Sender) under the
+        // same lock, so the pointer is valid here. `Sender` is `Sync` and we
+        // only take a shared reference, so this never aliases the `&mut
+        // NetStack` formed in `poll_next`. A full channel drops the packet;
+        // lwIP/TCP will retransmit as needed.
+        let tx = &*(OUTPUT_CB_PTR as *const Sender<Vec<u8>>);
+        let _ = tx.try_send(buf);
         err_enum_t_ERR_OK as err_t
     }
 }
