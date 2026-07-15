@@ -14,7 +14,7 @@
 //!
 //! Direction is encoded in the destination port so the netstack side can route
 //! each accepted connection / datagram to the right handler:
-//!   * TCP download dials dst 5000+i, TCP upload dials 6000+i
+//!   * TCP download dials dst 10000+i, TCP upload dials 20000+i
 //!   * UDP upload sends to dst 7000+i, UDP download targets peer port 18000+i
 //!
 //! Usage:
@@ -231,23 +231,23 @@ async fn run(cfg: Config_, n_tcp: usize, n_senders: usize) {
             let mut tcp_flows: Vec<TcpFlow> = Vec::new();
             let mut udp_flows: Vec<UdpFlow> = Vec::new();
 
-            // TCP download: peer connects to ns dst 5000+i, then reads.
+            // TCP download: peer connects to ns dst 10000+i, then reads.
             for i in 0..cfg.tcp_down {
                 let s = new_tcp_socket();
                 let h = sockets.add(s);
                 sockets
                     .get_mut::<tcp::Socket>(h)
-                    .connect(iface.context(), (NS_IP, 5000 + i as u16), 15000 + i as u16)
+                    .connect(iface.context(), (NS_IP, 10000 + i as u16), 40000 + i as u16)
                     .expect("connect tcp-down");
                 tcp_flows.push(TcpFlow { h, dir: Dir::Down, target: cfg.tcp_bytes, sent: 0, recv: 0, closing: false, done: false });
             }
-            // TCP upload: peer connects to ns dst 6000+i, then writes.
+            // TCP upload: peer connects to ns dst 20000+i, then writes.
             for i in 0..cfg.tcp_up {
                 let s = new_tcp_socket();
                 let h = sockets.add(s);
                 sockets
                     .get_mut::<tcp::Socket>(h)
-                    .connect(iface.context(), (NS_IP, 6000 + i as u16), 16000 + i as u16)
+                    .connect(iface.context(), (NS_IP, 20000 + i as u16), 45000 + i as u16)
                     .expect("connect tcp-up");
                 tcp_flows.push(TcpFlow { h, dir: Dir::Up, target: cfg.tcp_bytes, sent: 0, recv: 0, closing: false, done: false });
             }
@@ -364,10 +364,10 @@ async fn run(cfg: Config_, n_tcp: usize, n_senders: usize) {
             for _ in 0..n_tcp {
                 let (ns, _local, remote) = listener.next().await.expect("accept");
                 // remote_addr() is the destination the peer dialed.
-                let dir = if (remote.port() as usize) < 5000 + tcp_down {
-                    Dir::Down // dst 5000+i -> netstack writes
+                let dir = if (remote.port() as usize) < 10000 + tcp_down {
+                    Dir::Down // dst 10000+i -> netstack writes
                 } else {
-                    Dir::Up // dst 6000+i -> netstack reads
+                    Dir::Up // dst 20000+i -> netstack reads
                 };
                 handles.push(tokio::spawn(handle_tcp(
                     ns,
