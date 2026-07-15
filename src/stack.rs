@@ -136,46 +136,54 @@ impl Sink<Vec<u8>> for NetStack {
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if let Some(item) = unsafe { self.get_unchecked_mut() }.sink_buf.take() {
-            if item.is_empty() {
-                return Poll::Ready(Ok(()));
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let me = unsafe { self.get_unchecked_mut() };
+        let item = match me.sink_buf.take() {
+            Some(item) => item,
+            None => return Poll::Ready(Ok(())),
+        };
+        if item.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        unsafe {
+            let _g = LWIP_MUTEX.lock();
+
+            let pbuf = pbuf_alloc(pbuf_layer_PBUF_RAW, item.len() as u16_t, pbuf_type_PBUF_RAM);
+            if pbuf.is_null() {
+                // lwIP is out of memory. Keep the packet (don't drop it) and
+                // retry on a later poll. lwIP gives no "memory freed"
+                // notification, so wake ourselves to reschedule rather than
+                // stalling forever; memory is reclaimed as the timer task
+                // processes ACKs/timeouts.
+                log::trace!("pbuf_alloc null alloc");
+                me.sink_buf = Some(item);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
-            unsafe {
-                let _g = LWIP_MUTEX.lock();
+            pbuf_take(
+                pbuf,
+                item.as_ptr() as *const raw::c_void,
+                item.len() as u16_t,
+            );
 
-                let pbuf = pbuf_alloc(pbuf_layer_PBUF_RAW, item.len() as u16_t, pbuf_type_PBUF_RAM);
-                if pbuf.is_null() {
-                    log::trace!("pbuf_alloc null alloc");
-                    return Poll::Pending;
-                }
-                pbuf_take(
-                    pbuf,
-                    item.as_ptr() as *const raw::c_void,
-                    item.len() as u16_t,
-                );
-
-                if let Some(input_fn) = (*netif_list).input {
-                    let err = input_fn(pbuf, netif_list);
-                    if err == err_enum_t_ERR_OK as err_t {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        pbuf_free(pbuf);
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            format!("input error: {}", err),
-                        )))
-                    }
+            if let Some(input_fn) = (*netif_list).input {
+                let err = input_fn(pbuf, netif_list);
+                if err == err_enum_t_ERR_OK as err_t {
+                    Poll::Ready(Ok(()))
                 } else {
                     pbuf_free(pbuf);
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::Interrupted,
-                        "input fn not set",
+                        format!("input error: {}", err),
                     )))
                 }
+            } else {
+                pbuf_free(pbuf);
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "input fn not set",
+                )))
             }
-        } else {
-            Poll::Ready(Ok(()))
         }
     }
 
