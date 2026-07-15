@@ -1,5 +1,6 @@
 use std::{io, net::SocketAddr, os::raw, pin::Pin};
 use std::marker::PhantomPinned;
+use std::sync::Arc;
 
 use futures::stream::Stream;
 use futures::task::{Context, Poll, Waker};
@@ -73,8 +74,22 @@ fn send_udp(
 
 type UdpPkt = (Vec<u8>, SocketAddr, SocketAddr);
 
+/// Shared ownership of the underlying lwIP `udp_pcb`.
+///
+/// The pcb is removed only when the last handle (the `UdpSocket`/`RecvHalf`
+/// and every `SendHalf` obtained from `split`) is dropped, so a `SendHalf`
+/// can never outlive the pcb it sends on.
+struct UdpPcb(usize);
+
+impl Drop for UdpPcb {
+    fn drop(&mut self) {
+        let _g = super::LWIP_MUTEX.lock();
+        unsafe { udp_remove(self.0 as *mut udp_pcb) };
+    }
+}
+
 pub struct UdpSocket {
-    pcb: usize,
+    pcb: Arc<UdpPcb>,
     waker: Option<Waker>,
     tx: Sender<UdpPkt>,
     rx: Receiver<UdpPkt>,
@@ -92,7 +107,7 @@ impl UdpSocket {
             let pcb = udp_new();
             let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
             let socket = Box::pin(Self {
-                pcb: pcb as usize,
+                pcb: Arc::new(UdpPcb(pcb as usize)),
                 waker: None,
                 tx,
                 rx,
@@ -110,15 +125,21 @@ impl UdpSocket {
     }
 
     pub fn split(self: Pin<Box<Self>>) -> (SendHalf, RecvHalf) {
-        (SendHalf { pcb: self.pcb }, RecvHalf { socket: self })
+        let pcb = self.pcb.clone();
+        (SendHalf { pcb }, RecvHalf { socket: self })
     }
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
+        // Unregister the callback so lwIP stops calling into `tx`/`waker`,
+        // which are about to be freed. The pcb itself is removed by
+        // `UdpPcb::drop` once the last shared handle (this + any `SendHalf`)
+        // is gone. Release the lock before the fields (incl. the pcb `Arc`)
+        // are dropped, since `UdpPcb::drop` takes the same non-reentrant lock.
+        let _g = super::LWIP_MUTEX.lock();
         unsafe {
-            udp_recv(self.pcb as *mut udp_pcb, None, std::ptr::null_mut());
-            udp_remove(self.pcb as *mut udp_pcb);
+            udp_recv(self.pcb.0 as *mut udp_pcb, None, std::ptr::null_mut());
         }
     }
 }
@@ -141,7 +162,9 @@ impl Stream for UdpSocket {
 }
 
 pub struct SendHalf {
-    pub(crate) pcb: usize,
+    // Shared with the `RecvHalf`/`UdpSocket`; keeps the pcb alive for as long
+    // as this half exists, so `send_to` can never hit a removed pcb.
+    pcb: Arc<UdpPcb>,
 }
 
 impl SendHalf {
@@ -151,7 +174,7 @@ impl SendHalf {
         src_addr: &SocketAddr,
         dst_addr: &SocketAddr,
     ) -> io::Result<()> {
-        send_udp(src_addr, dst_addr, self.pcb, data)
+        send_udp(src_addr, dst_addr, self.pcb.0, data)
     }
 }
 
