@@ -330,19 +330,25 @@ impl AsyncWrite for TcpStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let _guard = LWIP_MUTEX.lock();
         if self.callback_ctx.errored.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
         let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
-        if err != err_enum_t_ERR_OK as err_t {
+        if err == err_enum_t_ERR_OK as err_t {
+            Poll::Ready(Ok(()))
+        } else if err == err_enum_t_ERR_MEM as err_t {
+            // Transient: lwIP couldn't build/send segments right now. Park until
+            // the sent/poll callback signals progress and retry, rather than
+            // reporting a spurious flush failure that would reset the connection.
+            self.callback_ctx.write_waker.register(cx.waker());
+            Poll::Pending
+        } else {
             Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 format!("netstack tcp_output error {}", err),
             )))
-        } else {
-            Poll::Ready(Ok(()))
         }
     }
 
