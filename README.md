@@ -119,6 +119,13 @@ How the limits work:
 - Each simultaneous connection needs one `tcp_pcb` (256 B). Idle/established
   connections cost only that; `MEMP_NUM_TCP_PCB` is the hard ceiling. There is no
   listen-backlog cap (`TCP_LISTEN_BACKLOG` is off).
+- Closed connections linger in `TIME_WAIT` for `2 * TCP_MSL` (here `TCP_MSL` is
+  10 s → 20 s), each holding a `tcp_pcb` from the same pool. lwIP reclaims the
+  oldest `TIME_WAIT` (then `LAST_ACK`/`CLOSING`) before ever evicting an active
+  connection, so connection churn never lowers active capacity. `TCP_MSL` is
+  shortened from lwIP's 60 s default because these connections are device-local
+  (no WAN path, so no stale duplicates to outlive), which keeps `TIME_WAIT` from
+  piling up under the churn a VPN sees.
 - Actively *transferring* connections additionally draw from the shared
   `MEM_SIZE` heap (send buffers) and `MEMP_NUM_TCP_SEG` segment pool. These are
   sized for realistic concurrent transfer, not for every connection at once;
