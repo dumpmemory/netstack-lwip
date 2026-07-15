@@ -40,3 +40,38 @@ tokio::spawn(async move {
     handle_inbound_datagram(udp_socket).await;
 });
 ```
+
+## Testing
+
+Run the unit and integration tests:
+
+```sh
+cargo test
+```
+
+This includes `tests/lifecycle.rs`, which exercises the shared-ownership
+lifetime binding (the process-global lwIP stack must stay alive until the last
+handle is dropped, and must be re-creatable afterwards).
+
+## Throughput benchmark
+
+`examples/throughput.rs` measures end-to-end TCP throughput in both directions.
+Because `NetStack` only *accepts* connections (it never dials), the benchmark
+uses [smoltcp](https://github.com/smoltcp-rs/smoltcp) as an in-process,
+userspace TCP peer wired directly to the `NetStack` `Sink`/`Stream` — so it
+needs no TUN device and no root, and runs anywhere:
+
+```sh
+# Both directions, 256 MiB each (defaults). Release build strongly recommended.
+cargo run --release --example throughput
+
+# Options:
+#   --bytes N   bytes to transfer per direction (default 268435456 = 256 MiB)
+#   --dir D     up | down | both (default both)
+#   --chunk N   application write size in bytes (default 65536 = 64 KiB)
+cargo run --release --example throughput -- --bytes 67108864 --dir both --chunk 65536
+```
+
+It exercises the full data path (download: `TcpStream` write → `tcp_output` →
+stack `Stream`; upload: stack `Sink` → `tcp_in` → `TcpStream` read), asserts the
+exact byte count transferred, and prints MiB/s and Gbps per direction.

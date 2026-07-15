@@ -17,3 +17,15 @@ thiserror = "1"
 [build-dependencies]
 cc = "1.0"
 bindgen = "0.70"
+
+[dev-dependencies]
+# End-to-end throughput benchmark uses smoltcp as an in-process, userspace TCP
+# peer wired straight to the NetStack Sink/Stream (bare-IP `Medium::Ip`), so no
+# TUN device or root is needed. See examples/throughput.rs.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+] }
