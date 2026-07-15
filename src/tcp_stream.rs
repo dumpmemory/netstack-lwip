@@ -304,16 +304,20 @@ impl AsyncWrite for TcpStream {
             )
         };
         if err == err_enum_t_ERR_OK as err_t {
-            // Call output in case of mem err?
-            let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
-            if err == err_enum_t_ERR_OK as err_t {
-                Poll::Ready(Ok(to_write))
-            } else {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!("netstack tcp_output error {}", err),
-                )))
+            // The bytes are now owned by lwIP (queued in `unsent`), so the write
+            // has succeeded regardless of whether we can flush them right now.
+            // tcp_output only *attempts* to send; a non-OK result here (usually
+            // ERR_MEM under memory pressure) is transient — lwIP flushes on the
+            // next timer tick, ACK, or poll_flush — so reporting it as a write
+            // failure would spuriously get an otherwise-healthy connection reset.
+            let out = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
+            if out != err_enum_t_ERR_OK as err_t {
+                trace!(
+                    "netstack tcp_output deferred ({}) on {}",
+                    out, self.callback_ctx.local_addr
+                );
             }
+            Poll::Ready(Ok(to_write))
         } else if err == err_enum_t_ERR_MEM as err_t {
             // trace!("netstack tcp err_mem on {}", &local_addr);
             self.callback_ctx.write_waker.register(cx.waker());
