@@ -100,12 +100,17 @@ impl NetStack {
             return Err(Error::AlreadyRunning);
         }
 
-        LWIP_INIT.call_once(|| unsafe { lwip_init() });
-
-        unsafe {
-            (*netif_list).output = Some(output_ip4);
-            (*netif_list).output_ip6 = Some(output_ip6);
-            (*netif_list).mtu = 1500;
+        {
+            let _g = LWIP_MUTEX.lock();
+            LWIP_INIT.call_once(|| unsafe { lwip_init() });
+            // Configure the (loopback) netif we repurpose as the TUN interface.
+            // Held under the lock for consistency with every other lwIP access,
+            // even though nothing else touches lwIP this early in setup.
+            unsafe {
+                (*netif_list).output = Some(output_ip4);
+                (*netif_list).output_ip6 = Some(output_ip6);
+                (*netif_list).mtu = 1500;
+            }
         }
 
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel(buffer_size);

@@ -57,6 +57,12 @@ fn send_udp(
         let _g = super::LWIP_MUTEX.lock();
         let pbuf =
             pbuf_alloc_reference(data.as_ptr() as *mut _, data.len() as _, pbuf_type_PBUF_REF);
+        if pbuf.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "pbuf_alloc_reference failed",
+            ));
+        }
         let src_ip = util::to_ip_addr_t(src_addr.ip());
         let dst_ip = util::to_ip_addr_t(dst_addr.ip());
         let err = udp_sendto(
@@ -216,7 +222,7 @@ impl RecvHalf {
             Some(pkt) => Ok(pkt),
             None => Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("recv_from udp socket faied: tx closed"),
+                "recv_from udp socket failed: tx closed",
             )),
         }
     }

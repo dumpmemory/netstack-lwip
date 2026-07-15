@@ -34,6 +34,12 @@ pub unsafe extern "C" fn tcp_recv_cb(
     // every field is thread-safe.
     let ctx = &*(arg as *const TcpStreamContext);
 
+    if err != err_enum_t_ERR_OK as err_t {
+        // lwIP documents this as currently always ERR_OK, but surface it if
+        // that ever changes rather than silently ignoring it.
+        warn!("netstack tcp recv error {} {}", err, ctx.local_addr);
+    }
+
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
         let _ = ctx.read_tx.send(Vec::new());
@@ -94,7 +100,7 @@ pub struct TcpStream {
     dest_addr: SocketAddr,
     pcb: usize,
     // Overflow buffer for read data that didn't fit the caller's buffer.
-    write_buf: BytesMut,
+    read_overflow: BytesMut,
     callback_ctx: TcpStreamContext,
     // Receiving end of the channel fed by `tcp_recv_cb`; owned solely by the
     // async side, so it needs no sharing/locking.
@@ -126,7 +132,7 @@ impl TcpStream {
                 src_addr,
                 dest_addr,
                 pcb: pcb as usize,
-                write_buf: BytesMut::new(),
+                read_overflow: BytesMut::new(),
                 callback_ctx: TcpStreamContext::new(src_addr, read_tx),
                 read_rx,
                 closed: false,
@@ -191,10 +197,15 @@ impl AsyncRead for TcpStream {
         if me.callback_ctx.errored.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
-        if !me.write_buf.is_empty() {
-            let to_read = min(buf.remaining(), me.write_buf.len());
-            let piece = me.write_buf.split_to(to_read);
+        if !me.read_overflow.is_empty() {
+            let to_read = min(buf.remaining(), me.read_overflow.len());
+            let piece = me.read_overflow.split_to(to_read);
             buf.put_slice(&piece[..to_read]);
+            // Advance the receive window for the overflow bytes now that they've
+            // been consumed (they weren't counted when first received).
+            if to_read > 0 {
+                unsafe { tcp_recved(me.pcb as *mut tcp_pcb, to_read as u16_t) };
+            }
             return Poll::Ready(Ok(()));
         }
         let mut has_read_data = false;
@@ -210,12 +221,18 @@ impl AsyncRead for TcpStream {
                         me.is_eof = true;
                         return Poll::Ready(Ok(()));
                     }
-                    unsafe { tcp_recved(me.pcb as *mut tcp_pcb, data.len() as u16_t) };
                     let to_read = min(buf.remaining(), data.len());
                     buf.put_slice(&data[..to_read]);
+                    // Advance lwIP's receive window only for the bytes actually
+                    // handed to the caller, so flow control (the announced
+                    // window) reflects real consumption. Any remainder is
+                    // stashed and its window advanced when it is later drained.
+                    if to_read > 0 {
+                        unsafe { tcp_recved(me.pcb as *mut tcp_pcb, to_read as u16_t) };
+                    }
                     has_read_data = true;
                     if to_read < data.len() {
-                        me.write_buf.extend_from_slice(&data[to_read..]);
+                        me.read_overflow.extend_from_slice(&data[to_read..]);
                         return Poll::Ready(Ok(()));
                     }
                 }
