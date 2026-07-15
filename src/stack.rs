@@ -5,6 +5,7 @@ use futures::sink::Sink;
 use futures::stream::Stream;
 use futures::task::{Context, Poll};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::task::JoinHandle;
 
 use super::lwip::*;
 use super::output::{output_ip4, output_ip6, OUTPUT_CB_PTR};
@@ -24,6 +25,9 @@ pub struct NetStack {
     // has to form a reference to `NetStack`, which would alias the `&mut` taken
     // in `poll_next` and be undefined behaviour.
     output_tx: usize,
+    // Background task driving lwIP's timers; aborted on drop so it doesn't
+    // keep running (and calling into lwIP) after the stack is gone.
+    timer: JoinHandle<()>,
     _pin: PhantomPinned,
 }
 
@@ -59,19 +63,7 @@ impl NetStack {
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel(buffer_size);
         let output_tx = Box::into_raw(Box::new(tx)) as usize;
 
-        let stack = Box::pin(NetStack {
-            rx,
-            sink_buf: None,
-            output_tx,
-            _pin: PhantomPinned::default(),
-        });
-
-        unsafe {
-            let _g = LWIP_MUTEX.lock();
-            OUTPUT_CB_PTR = output_tx;
-        }
-
-        tokio::spawn(async move {
+        let timer = tokio::spawn(async move {
             loop {
                 {
                     let _g = LWIP_MUTEX.lock();
@@ -81,6 +73,19 @@ impl NetStack {
             }
         });
 
+        let stack = Box::pin(NetStack {
+            rx,
+            sink_buf: None,
+            output_tx,
+            timer,
+            _pin: PhantomPinned::default(),
+        });
+
+        unsafe {
+            let _g = LWIP_MUTEX.lock();
+            OUTPUT_CB_PTR = output_tx;
+        }
+
         stack
     }
 
@@ -89,6 +94,10 @@ impl NetStack {
 impl Drop for NetStack {
     fn drop(&mut self) {
         log::trace!("drop netstack");
+        // Stop the timer task so it no longer drives lwIP after the stack is
+        // gone. It only holds LWIP_MUTEX inside a synchronous block (no `.await`
+        // in scope), so aborting can never leave the lock held.
+        self.timer.abort();
         unsafe {
             let _g = LWIP_MUTEX.lock();
             // Only clear the global if it still points at our Sender: a later
