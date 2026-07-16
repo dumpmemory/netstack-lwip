@@ -41,6 +41,15 @@ tokio::spawn(async move {
 });
 ```
 
+## Building
+
+Building requires **libclang** (used by [bindgen](https://github.com/rust-lang/rust-bindgen)):
+the lwIP bindings are generated at build time for the exact target being
+compiled, so their ABI (struct layouts, integer widths) always matches — there
+are no pre-generated bindings checked in. Install it via your platform's LLVM
+package (e.g. `apt install libclang-dev`, `brew install llvm`, or the Xcode
+command-line tools on macOS, where it is already present).
+
 ## Testing
 
 Run the unit and integration tests:
