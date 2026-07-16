@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::marker::PhantomPinned;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -73,6 +74,10 @@ impl Drop for StackHandle {
 pub struct NetStack {
     rx: Receiver<Vec<u8>>,
     sink_buf: Option<Vec<u8>>, // We're flushing per item, no need large buffer.
+    // Timed backoff for retrying `poll_flush` when lwIP is out of pbuf memory.
+    // lwIP gives no "memory freed" notification, so retry on a short timer
+    // instead of self-waking, which would spin the executor at 100% CPU.
+    alloc_backoff: Option<Pin<Box<tokio::time::Sleep>>>,
     // Keeps the shared lwIP stack alive for as long as this `NetStack` exists.
     _stack: Arc<StackHandle>,
     _pin: PhantomPinned,
@@ -131,6 +136,7 @@ impl NetStack {
         let stack = Box::pin(NetStack {
             rx,
             sink_buf: None,
+            alloc_backoff: None,
             _stack: handle.clone(),
             _pin: PhantomPinned::default(),
         });
@@ -192,15 +198,31 @@ impl Sink<Vec<u8>> for NetStack {
             let pbuf = pbuf_alloc(pbuf_layer_PBUF_RAW, item.len() as u16_t, pbuf_type_PBUF_RAM);
             if pbuf.is_null() {
                 // lwIP is out of memory. Keep the packet (don't drop it) and
-                // retry on a later poll. lwIP gives no "memory freed"
-                // notification, so wake ourselves to reschedule rather than
-                // stalling forever; memory is reclaimed as the timer task
-                // processes ACKs/timeouts.
+                // retry after a short backoff — memory is reclaimed as the
+                // timer task processes ACKs/timeouts, typically within a few
+                // milliseconds. Self-waking instead would busy-spin the
+                // executor at 100% CPU for as long as the pressure lasts.
                 log::trace!("pbuf_alloc null alloc");
                 me.sink_buf = Some(item);
-                cx.waker().wake_by_ref();
+                const BACKOFF: time::Duration = time::Duration::from_millis(10);
+                let deadline = tokio::time::Instant::now() + BACKOFF;
+                let sleep = match me.alloc_backoff.as_mut() {
+                    Some(sleep) => {
+                        // Re-arm the existing (elapsed) timer from a previous
+                        // failed retry.
+                        sleep.as_mut().reset(deadline);
+                        sleep
+                    }
+                    None => me
+                        .alloc_backoff
+                        .insert(Box::pin(tokio::time::sleep_until(deadline))),
+                };
+                // Freshly armed 10ms ahead, so this registers the timer wakeup
+                // rather than completing.
+                let _ = sleep.as_mut().poll(cx);
                 return Poll::Pending;
             }
+            me.alloc_backoff = None;
             pbuf_take(
                 pbuf,
                 item.as_ptr() as *const raw::c_void,
