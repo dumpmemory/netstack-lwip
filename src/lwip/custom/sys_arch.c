@@ -197,6 +197,9 @@
   {
       struct timespec ts;
       clock_gettime(CLOCK_MONOTONIC, &ts);
-      return (u32_t)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
+      /* Multiply in 64 bits: on 32-bit targets `tv_sec * 1000L` overflows
+       * (signed, UB) once uptime exceeds ~24.8 days. The final u32 wrap-around
+       * (~49.7 days) is fine — lwIP handles sys_now() wrapping by design. */
+      return (u32_t)((u64_t)ts.tv_sec * 1000 + (u32_t)(ts.tv_nsec / 1000000));
   }
 #endif
