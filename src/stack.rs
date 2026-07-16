@@ -54,18 +54,18 @@ impl Drop for StackHandle {
         // gone. It only holds LWIP_MUTEX inside a synchronous block (no `.await`
         // in scope), so aborting can never leave the lock held.
         self.timer.abort();
-        unsafe {
+        {
             let _g = LWIP_MUTEX.lock();
             // Only clear the global if it still points at our Sender: a later
             // NetStack may have overwritten it.
-            if OUTPUT_CB_PTR == self.output_tx {
-                OUTPUT_CB_PTR = 0x0;
+            if OUTPUT_CB_PTR.load(Ordering::Acquire) == self.output_tx {
+                OUTPUT_CB_PTR.store(0, Ordering::Release);
             }
             // Reclaim the callback Sender. Safe under the lock: the output
             // callback only runs while LWIP_MUTEX is held, so it cannot be
             // reading this pointer concurrently, and it will no longer see it.
-            drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>));
-        };
+            unsafe { drop(Box::from_raw(self.output_tx as *mut Sender<Vec<u8>>)) };
+        }
         // Allow a new NetStack to be created now that this one is gone.
         NETSTACK_ALIVE.store(false, Ordering::Release);
     }
@@ -141,9 +141,9 @@ impl NetStack {
             _pin: PhantomPinned::default(),
         });
 
-        unsafe {
+        {
             let _g = LWIP_MUTEX.lock();
-            OUTPUT_CB_PTR = output_tx;
+            OUTPUT_CB_PTR.store(output_tx, Ordering::Release);
         }
 
         Ok((stack, handle))
