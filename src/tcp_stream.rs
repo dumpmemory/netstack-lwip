@@ -42,6 +42,23 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
+        if ctx.tx_closed.load(Ordering::Acquire) {
+            // Our FIN is already out and the peer's FIN just arrived, so the
+            // pcb is completing the close handshake (CLOSING or TIME_WAIT).
+            // From TIME_WAIT lwIP frees it after 2*TCP_MSL with NO callback
+            // (tcp_slowtmr reclaims tw pcbs silently), so this is the last
+            // moment the pcb is certainly alive: detach the callbacks and mark
+            // it off-limits now. Drop/poll_* must not touch it after this.
+            ctx.pcb_gone.store(true, Ordering::Release);
+            tcp_arg(tpcb, std::ptr::null_mut());
+            tcp_recv(tpcb, None);
+            tcp_sent(tpcb, None);
+            tcp_err(tpcb, None);
+            tcp_poll(tpcb, None, 0);
+            // A writer parked before the shutdown would otherwise never be
+            // woken again (the sent/poll callbacks are detached now).
+            ctx.write_waker.wake();
+        }
         let _ = ctx.read_tx.send(Vec::new());
         return err_enum_t_ERR_OK as err_t;
     }
@@ -78,7 +95,14 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     // SAFETY: see `tcp_recv_cb`.
     let ctx = unsafe { &*(arg as *const TcpStreamContext) };
     trace!("netstack tcp err {} {}", err, ctx.local_addr);
-    ctx.errored.store(true, Ordering::Release);
+    // lwIP has already freed the pcb when this callback fires; it must never
+    // be touched again. ERR_CLSD is not a failure: it reports the close
+    // handshake completing after both sides shut down (the CLOSE_WAIT ->
+    // LAST_ACK path), so the reader should see a clean EOF, not a broken pipe.
+    ctx.pcb_gone.store(true, Ordering::Release);
+    if err != err_enum_t_ERR_CLSD as err_t {
+        ctx.errored.store(true, Ordering::Release);
+    }
     // Wake a parked reader via an empty-vec sentinel and a parked writer.
     let _ = ctx.read_tx.send(Vec::new());
     ctx.write_waker.wake();
@@ -105,8 +129,6 @@ pub struct TcpStream {
     // Receiving end of the channel fed by `tcp_recv_cb`; owned solely by the
     // async side, so it needs no sharing/locking.
     read_rx: UnboundedReceiver<Vec<u8>>,
-    // Whether the write side has been shut down; touched only by the async side.
-    closed: bool,
     is_eof: bool,
     // Keeps the shared lwIP stack alive for as long as this connection exists,
     // so the timer keeps driving it even if the netstack/listener are dropped.
@@ -135,7 +157,6 @@ impl TcpStream {
                 read_overflow: BytesMut::new(),
                 callback_ctx: TcpStreamContext::new(src_addr, read_tx),
                 read_rx,
-                closed: false,
                 is_eof: false,
                 _stack: stack,
                 _pin: PhantomPinned::default(),
@@ -263,10 +284,11 @@ impl AsyncRead for TcpStream {
 
         if consumed > 0 {
             let _guard = LWIP_MUTEX.lock();
-            // Re-check under the lock: during the lockless drain, tcp_err_cb
-            // (which runs under LWIP_MUTEX) may have fired and lwIP may have
-            // freed the pcb, so calling tcp_recved on it would be use-after-free.
-            if !me.callback_ctx.errored.load(Ordering::Acquire) {
+            // Re-check under the lock: during the lockless drain a callback
+            // (which runs under LWIP_MUTEX) may have marked the pcb gone —
+            // errored, gracefully closed, or parked in TIME_WAIT — and lwIP may
+            // have freed it, so calling tcp_recved would be use-after-free.
+            if !me.callback_ctx.pcb_gone.load(Ordering::Acquire) {
                 // tcp_recved takes a u16, but a single read can consume more
                 // than 65535 bytes (e.g. a 64 KiB buffer), so advance the window
                 // in u16-sized chunks rather than truncating.
@@ -286,7 +308,10 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         let _guard = LWIP_MUTEX.lock();
         trace!("netstack tcp drop {}", &self.callback_ctx.local_addr);
-        if !self.callback_ctx.errored.load(Ordering::Acquire) {
+        // If the pcb is gone (errored, close handshake completed, or parked in
+        // TIME_WAIT for lwIP to reclaim), the callbacks are already detached
+        // and the pcb may already be freed — don't touch it.
+        if !self.callback_ctx.pcb_gone.load(Ordering::Acquire) {
             unsafe {
                 let pcb = self.pcb as *mut tcp_pcb;
                 // Detach our callbacks first: the TcpStreamContext is freed once
@@ -298,7 +323,7 @@ impl Drop for TcpStream {
                 tcp_sent(pcb, None);
                 tcp_err(pcb, None);
                 tcp_poll(pcb, None, 0);
-                if self.closed {
+                if self.callback_ctx.tx_closed.load(Ordering::Acquire) {
                     // poll_shutdown only closed the TX side (SHUT_WR), which
                     // does not set TF_RXCLOSED, so lwIP would never time out a
                     // pcb parked in FIN_WAIT_2 awaiting the peer's FIN — leaking
@@ -318,7 +343,9 @@ impl Drop for TcpStream {
 impl AsyncWrite for TcpStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         let _guard = LWIP_MUTEX.lock();
-        if self.callback_ctx.errored.load(Ordering::Acquire) {
+        // `pcb_gone` covers both cases that make writing impossible: an error
+        // (`errored` implies it) and a completed close.
+        if self.callback_ctx.pcb_gone.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
         let to_write = buf.len().min(self.send_buf_size());
@@ -366,6 +393,11 @@ impl AsyncWrite for TcpStream {
         if self.callback_ctx.errored.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
+        if self.callback_ctx.pcb_gone.load(Ordering::Acquire) {
+            // Gracefully closed: everything (including our FIN) has been sent
+            // and acknowledged, so there is nothing left to flush.
+            return Poll::Ready(Ok(()));
+        }
         let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
         if err == err_enum_t_ERR_OK as err_t {
             Poll::Ready(Ok(()))
@@ -384,20 +416,26 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        let me = unsafe { self.get_unchecked_mut() };
         let _guard = LWIP_MUTEX.lock();
-        if me.callback_ctx.errored.load(Ordering::Acquire) {
+        if self.callback_ctx.errored.load(Ordering::Acquire) {
             return Poll::Ready(Err(broken_pipe()));
         }
-        trace!("netstack tcp shutdown {}", &me.callback_ctx.local_addr);
-        let err = unsafe { tcp_shutdown(me.pcb as *mut tcp_pcb, 0, 1) };
+        // Idempotent: already shut down (or the close handshake has since
+        // completed and the pcb is gone) — nothing more to do.
+        if self.callback_ctx.tx_closed.load(Ordering::Acquire)
+            || self.callback_ctx.pcb_gone.load(Ordering::Acquire)
+        {
+            return Poll::Ready(Ok(()));
+        }
+        trace!("netstack tcp shutdown {}", &self.callback_ctx.local_addr);
+        let err = unsafe { tcp_shutdown(self.pcb as *mut tcp_pcb, 0, 1) };
         if err != err_enum_t_ERR_OK as err_t {
             Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 format!("netstack tcp_shutdown tx error {}", err),
             )))
         } else {
-            me.closed = true;
+            self.callback_ctx.tx_closed.store(true, Ordering::Release);
             Poll::Ready(Ok(()))
         }
     }

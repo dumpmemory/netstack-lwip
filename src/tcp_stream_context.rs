@@ -20,8 +20,19 @@ pub struct TcpStreamContext {
     /// Carries received data — and an empty-vec sentinel on EOF/error — to
     /// `TcpStream::poll_read`. `send` needs only `&self`.
     pub read_tx: UnboundedSender<Vec<u8>>,
-    /// Set by the lwIP error callback; once true the pcb is no longer valid.
+    /// The connection failed (reset/aborted). Reported to the user as an
+    /// error. Implies `pcb_gone`.
     pub errored: AtomicBool,
+    /// The pcb must no longer be touched: lwIP freed it (error callback, or
+    /// the close handshake completing via `ERR_CLSD`), or it entered
+    /// TIME_WAIT — from which lwIP reclaims it silently, with no callback.
+    /// The lwIP callbacks are detached by whoever sets this. Only written
+    /// while `LWIP_MUTEX` is held; decisions to call into lwIP based on it
+    /// must read it under the same lock.
+    pub pcb_gone: AtomicBool,
+    /// The TX side has been shut down (our FIN sent) via `poll_shutdown`.
+    /// Only written while `LWIP_MUTEX` is held.
+    pub tx_closed: AtomicBool,
     /// Registered by `poll_write`, woken by the sent/poll/err callbacks.
     pub write_waker: AtomicWaker,
 }
@@ -32,6 +43,8 @@ impl TcpStreamContext {
             local_addr,
             read_tx,
             errored: AtomicBool::new(false),
+            pcb_gone: AtomicBool::new(false),
+            tx_closed: AtomicBool::new(false),
             write_waker: AtomicWaker::new(),
         }
     }
