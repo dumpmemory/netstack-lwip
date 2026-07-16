@@ -8,7 +8,7 @@ mod tcp_stream_context;
 pub mod udp;
 mod util;
 
-pub(crate) static LWIP_MUTEX: mutex::AtomicMutex = mutex::AtomicMutex::new();
+pub(crate) static LWIP_MUTEX: mutex::LwipMutex = mutex::LwipMutex::new();
 
 pub use stack::NetStack;
 pub use tcp_listener::TcpListener;
