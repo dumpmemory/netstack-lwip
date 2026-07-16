@@ -73,24 +73,7 @@
 #define LWIP_IPV6_MLD 0
 #define LWIP_IPV6_AUTOCONFIG 1
 
-#if defined __APPLE__
-#include <TargetConditionals.h>
-
-// Connection-count targets (a VPN handles every connection on the device):
-// iOS ~512, other platforms ~2048. Each simultaneous connection needs one
-// tcp_pcb (256 B, static); idle connections cost only that. MEMP_NUM_TCP_SEG is
-// the shared pool of queued segments used only by actively-transferring
-// connections (up to TCP_SND_QUEUELEN = 64 each); running out throttles a
-// sender (graceful ERR_MEM), it does not drop connections.
-#if TARGET_OS_IPHONE
-#define LWIP_TCP_KEEPALIVE 1
-#define MEMP_NUM_TCP_PCB 512
-#define MEMP_NUM_TCP_SEG 4096
-#else
-#define MEMP_NUM_TCP_PCB 2048
-#define MEMP_NUM_TCP_SEG 16384
-#endif
-#elif defined __linux__
+#if defined __linux__
 #include <endian.h>
 
 // BYTE_ORDER by default is LITTLE_ENDIAN if undefined,
@@ -100,12 +83,6 @@
 #define BYTE_ORDER BIG_ENDIAN
 #endif
 #endif
-
-#define MEMP_NUM_TCP_PCB 2048
-#define MEMP_NUM_TCP_SEG 16384
-#else
-#define MEMP_NUM_TCP_PCB 2048
-#define MEMP_NUM_TCP_SEG 16384
 #endif
 
 // disable checksum checks
@@ -129,46 +106,61 @@
 // and frees pcbs ~6x faster (TIME_WAIT 20s instead of 120s).
 #define TCP_MSL 10000UL
 
+// ---- Per-platform sizing ---------------------------------------------------
+//
+// Connection-count targets (a VPN handles every connection on the device):
+// iOS ~512, other platforms ~2048. Each simultaneous connection needs one
+// tcp_pcb (256 B, static); idle connections cost only that. MEMP_NUM_TCP_SEG is
+// the shared pool of queued segments used only by actively-transferring
+// connections (up to TCP_SND_QUEUELEN = 64 each); running out throttles a
+// sender (graceful ERR_MEM), it does not drop connections.
+//
 // The lwIP TCP here is device-local (app <-> netstack, ~microsecond RTT), so a
 // small window still saturates it; the window mainly bounds how much unread
-// data buffers per connection (lwIP ooseq pbufs + the read channel). iOS keeps
-// it small so the worst-case buffering across its ~512 connections stays within
-// the Network Extension memory budget; other platforms keep the larger window
-// for higher single-stream throughput.
+// data buffers per connection (lwIP ooseq pbufs + the read channel). MEM_SIZE
+// is the shared heap for PBUF_RAM: TCP send buffers (up to TCP_SND_BUF per
+// active sender) and transient inbound pbufs — sized for concurrent active
+// transfer, not for the full connection count (idle connections use no heap).
+//
+// iOS keeps everything lean so the worst case across its ~512 connections
+// stays within the Network Extension memory budget; other platforms use the
+// larger sizes below for higher throughput.
 #if defined __APPLE__
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
+#define LWIP_TCP_KEEPALIVE 1
+#define MEMP_NUM_TCP_PCB 512
+#define MEMP_NUM_TCP_SEG 4096
 #define TCP_WND (16 * TCP_MSS)
 #define TCP_SND_BUF (8 * TCP_MSS)
-#else
-#define TCP_WND (32 * TCP_MSS)
-#define TCP_SND_BUF (16 * TCP_MSS)
+#define MEM_SIZE (1024 * 1024)
 #endif
-#else
-#define TCP_WND (32 * TCP_MSS)
-#define TCP_SND_BUF (16 * TCP_MSS)
 #endif
 
-// Shared heap for PBUF_RAM: TCP send buffers (up to TCP_SND_BUF per active
-// sender) and transient inbound pbufs. Sized for concurrent active transfer,
-// not for the full connection count (idle connections use no heap); overflow
-// throttles gracefully. iOS stays lean for the Network Extension budget.
-#if defined __APPLE__
-#include <TargetConditionals.h>
-#if TARGET_OS_IPHONE
-#define MEM_SIZE (1024 * 1024)
-#else
+// Defaults for every platform not tuned above.
+#ifndef MEMP_NUM_TCP_PCB
+#define MEMP_NUM_TCP_PCB 2048
+#endif
+#ifndef MEMP_NUM_TCP_SEG
+#define MEMP_NUM_TCP_SEG 16384
+#endif
+#ifndef TCP_WND
+#define TCP_WND (32 * TCP_MSS)
+#endif
+#ifndef TCP_SND_BUF
+#define TCP_SND_BUF (16 * TCP_MSS)
+#endif
+#ifndef MEM_SIZE
 #define MEM_SIZE (8 * 1024 * 1024)
 #endif
-#else
-#define MEM_SIZE (8 * 1024 * 1024)
-#endif
+// -----------------------------------------------------------------------------
 
 // PBUF_POOL is unused on this data path (RX uses PBUF_RAM via the sink, TX uses
 // PBUF_RAM, UDP uses PBUF_REF), so the default large pool is ~1.5 KB/entry of
 // wasted static RAM. Keep a small margin for incidental/cold-path allocations.
-// The lwIP sanity check ties PBUF_POOL_SIZE to TCP_WND assuming pool-based RX
-// (false here), so disable it. MEMP_NUM_TCP_SEG is set per-platform above.
+// The lwIP sanity checks tie PBUF_POOL_SIZE to TCP_WND assuming pool-based RX
+// (false here), so they are disabled; the checks that DO still apply are
+// re-asserted in sys_arch.c, where lwIP's derived macros are available.
 #define PBUF_POOL_SIZE 16
 #define LWIP_DISABLE_TCP_SANITY_CHECKS 1
 

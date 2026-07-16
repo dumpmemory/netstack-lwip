@@ -1,5 +1,36 @@
 #include "lwip/opt.h"
+#include "lwip/def.h" /* LWIP_MIN/LWIP_MAX, used by the TCP_SND*LOWAT macros */
 #include "lwip/sys.h"
+
+/* lwipopts.h sets LWIP_DISABLE_TCP_SANITY_CHECKS because two of lwIP's checks
+ * assume PBUF_POOL-based RX (they tie PBUF_POOL_SIZE to TCP_WND), which does
+ * not apply to this stack (RX/TX use PBUF_RAM). That switch is all-or-nothing,
+ * so re-assert here the checks from init.c that DO still apply. This file is
+ * compiled after opt.h has derived TCP_SND_QUEUELEN etc., which lwipopts.h
+ * itself cannot see. */
+#if LWIP_TCP
+#if !MEMP_MEM_MALLOC && (MEMP_NUM_TCP_SEG < TCP_SND_QUEUELEN)
+#error "MEMP_NUM_TCP_SEG should be at least as big as TCP_SND_QUEUELEN"
+#endif
+#if TCP_SND_BUF < (2 * TCP_MSS)
+#error "TCP_SND_BUF must be at least as much as (2 * TCP_MSS)"
+#endif
+#if TCP_SND_QUEUELEN < (2 * (TCP_SND_BUF / TCP_MSS))
+#error "TCP_SND_QUEUELEN must be at least as much as (2 * TCP_SND_BUF/TCP_MSS)"
+#endif
+#if TCP_SNDLOWAT >= TCP_SND_BUF
+#error "TCP_SNDLOWAT must be less than TCP_SND_BUF"
+#endif
+#if TCP_SNDLOWAT >= (0xFFFF - (4 * TCP_MSS))
+#error "TCP_SNDLOWAT must at least be 4*MSS below u16_t overflow"
+#endif
+#if TCP_SNDQUEUELOWAT >= TCP_SND_QUEUELEN
+#error "TCP_SNDQUEUELOWAT must be less than TCP_SND_QUEUELEN"
+#endif
+#if TCP_WND < TCP_MSS
+#error "TCP_WND is smaller than MSS"
+#endif
+#endif /* LWIP_TCP */
 
 #ifdef _WIN32
   // defines both win32 and win64
